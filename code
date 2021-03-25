@@ -1,0 +1,26 @@
+Tidymodels examples
+Stratfy on the outcome so it can balance the outcome to avoid misifting models
+```{r}
+library(tidymodels)
+library(dplyr)
+mpg_split = initial_split(mpg, prop = .75, strata = hwy)
+mpg_training =  mpg_split %>%
+  training()
+mpg_training
+
+mpg_test = mpg_split %>%
+  testing()
+mpg_test
+
+lm_model = linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_fit = lm_model %>%
+  fit(hwy ~ cty, data = mpg_training) %>%
+  tidy()
+lm_fit
+
+hwy_preds = lm_fit %>%
+  predict(new_data = mpg_test)
+```
