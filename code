@@ -14,13 +14,28 @@ mpg_test
 
 lm_model = linear_reg() %>%
   set_engine("lm") %>%
+  #Classifcation or regression
   set_mode("regression")
 
 lm_fit = lm_model %>%
-  fit(hwy ~ cty, data = mpg_training) %>%
-  tidy()
-lm_fit
-
+  fit(hwy ~ cty, data = mpg_training)
+tidy_fit = lm_fit %>%
+  tidy() %>%
+  mutate_if(is.numeric, round, 2)
+tidy_fit
 hwy_preds = lm_fit %>%
   predict(new_data = mpg_test)
+hwy_preds
+
+### Create a results data set
+hwy_results = mpg_test %>%
+  select(cty, hwy) %>%
+  bind_cols(hwy_preds)
+hwy_results
+
+#### Does it all in one
+lm_last_fit = lm_model %>%
+  last_fit(hwy ~ cty, split = mpg_split)
+lm_last_fit %>%
+  collect_metrics()
 ```
