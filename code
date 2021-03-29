@@ -7,6 +7,9 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 Load and library data 
+Example websites:
+https://www.r-bloggers.com/2020/05/tidymodels-and-xgbooost-a-few-learnings/
+https://www.r-bloggers.com/2020/05/using-xgboost-with-tidymodels/
 ```{r}
 setwd("~/Google Drive/Future_skills/AMA/Data")
 ama_dat = read.csv("AMAData.csv", header = TRUE)
@@ -14,6 +17,8 @@ library(tidymodels)
 library(dplyr)
 library(lubridate)
 library(naniar)
+library(tableone)
+library(tidypredict)
 ```
 AMA XGBoost 
 ##################
@@ -31,25 +36,32 @@ ama_dat_evaluable = ama_dat_evaluable %>%
   mutate(DischargeType = case_when(
     DischargeType == "AMA Against Medical Advice" ~1, 
     TRUE ~ 0)) %>%
-  mutate(A298_Q7 = case_when(
+  mutate(female = case_when(
     A298_Q7 == "Female" ~ 1, 
     TRUE ~ 0)) %>%
-  mutate(A298_Q6 = case_when(
+  mutate(non_white = case_when(
     A298_Q6 == "White or Caucasian" ~ 0,
     TRUE ~ 1)) %>%
   mutate(Client_ASSESS_Date = mdy(Client_ASSESS_Date)) %>%
   mutate(quarter = quarter(Client_ASSESS_Date)) %>%
-  select(-c(Client_ASSESS_Date)) %>%
-  drop_na() %>%
-  mutate(DischargeType = as.character(DischargeType))
-ama_dat_evaluable
+  select(-c(Client_ASSESS_Date, A298_Q7, A298_Q6)) %>%
+  mutate(DischargeType = as.factor(DischargeType)) %>%
+  drop_na() 
+
 ```
+Check descirptives
+```{r}
+tab1 = CreateTableOne(data = ama_dat_evaluable)
+print(tab1, showAllLevels = TRUE)
+```
+
+
 Split the data
 ```{r}
-ama_split = initial_split(ama_dat, prop = .25, strata = DischargeType)
+ama_split = initial_split(ama_dat_evaluable, prop = .30, strata = DischargeType)
 ama_training = training(ama_split)
 ama_testing = testing(ama_split)
-ama_cv_folds =  vfold_cv(data = ama_training, v = 10)
+ama_cv_folds =  vfold_cv(data = ama_training, v = 5)
 ama_cv_folds
 ```
 Set the engine
@@ -96,6 +108,44 @@ xgTuned <- tune_grid(
   grid      = xgGrid,
   metrics   = metric_set(bal_accuracy),
   control   = control_grid(verbose = TRUE))
+xgTuned
+```
+Find the best model and select it
+Now how do you save the model???
+```{r}
+xgBestParams = xgTuned %>% 
+  tune::select_best(metric = "bal_accuracy")
+xgBestParams
+
+xgboost_model_final <- xgmodel %>% 
+  finalize_model(xgBestParams)
+
+xgTrainFit<-xgboost_model_final %>% 
+  fit(DischargeType ~., data=ama_testing)
+
+xgTrainPreds<- xgTrainFit %>% predict(new_data=ama_testing)
+xgTrainPredProbs <- xgTrainFit %>% predict_classprob.model_fit(new_data=ama_testing)
+xgTrainPredProbs
+
+parsed_model = parse_model(xgTrainFit)
+install.packages("yaml")
+library(yaml)
+write_yaml(parsed_model, "my_model.yml")
+
+xgTrainFit_read = read_yaml("my_model.yml")
+xgTrainFit_par <- as_parsed_model(xgTrainFit_read)
+xgTrainPreds <- xgTrainFit_par %>% predict(new_data=ama_testing)
+xgTrainPreds =  tidypredict_fit(xgTrainFit_par)
+
+saveRDS(xgTrainFit, "./xgTrainFit.rds")
+
+# later...
+
+# load the model
+super_model <- readRDS("./xgTrainFit.rds")
+print(super_model)
+# make a predictions on "new data" using the final model
+test <- super_model %>% predict(new_data=ama_testing)
+test
 
 ```
-
