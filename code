@@ -1,41 +1,101 @@
-Tidymodels examples
-Stratfy on the outcome so it can balance the outcome to avoid misifting models
+---
+title: "Test"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Load and library data 
 ```{r}
+setwd("~/Google Drive/Future_skills/AMA/Data")
+ama_dat = read.csv("AMAData.csv", header = TRUE)
 library(tidymodels)
 library(dplyr)
-mpg_split = initial_split(mpg, prop = .75, strata = hwy)
-mpg_training =  mpg_split %>%
-  training()
-mpg_training
-
-mpg_test = mpg_split %>%
-  testing()
-mpg_test
-
-lm_model = linear_reg() %>%
-  set_engine("lm") %>%
-  #Classifcation or regression
-  set_mode("regression")
-
-lm_fit = lm_model %>%
-  fit(hwy ~ cty, data = mpg_training)
-tidy_fit = lm_fit %>%
-  tidy() %>%
-  mutate_if(is.numeric, round, 2)
-tidy_fit
-hwy_preds = lm_fit %>%
-  predict(new_data = mpg_test)
-hwy_preds
-
-### Create a results data set
-hwy_results = mpg_test %>%
-  select(cty, hwy) %>%
-  bind_cols(hwy_preds)
-hwy_results
-
-#### Does it all in one
-lm_last_fit = lm_model %>%
-  last_fit(hwy ~ cty, split = mpg_split)
-lm_last_fit %>%
-  collect_metrics()
+library(lubridate)
+library(naniar)
 ```
+AMA XGBoost 
+##################
+Preprocess the data 
+##################
+Client_ASSESS_Date 
+AgeAtAdmission 
+DischargeType 
+A298_Q7 = Gender
+A298_Q6 = Race
+```{r}
+ama_dat_evaluable = ama_dat %>%
+  select(DischargeType, A298_Q7, A298_Q6, AgeAtAdmission, Client_ASSESS_Date)
+ama_dat_evaluable = ama_dat_evaluable %>%
+  mutate(DischargeType = case_when(
+    DischargeType == "AMA Against Medical Advice" ~1, 
+    TRUE ~ 0)) %>%
+  mutate(A298_Q7 = case_when(
+    A298_Q7 == "Female" ~ 1, 
+    TRUE ~ 0)) %>%
+  mutate(A298_Q6 = case_when(
+    A298_Q6 == "White or Caucasian" ~ 0,
+    TRUE ~ 1)) %>%
+  mutate(Client_ASSESS_Date = mdy(Client_ASSESS_Date)) %>%
+  mutate(quarter = quarter(Client_ASSESS_Date)) %>%
+  select(-c(Client_ASSESS_Date)) %>%
+  drop_na() %>%
+  mutate(DischargeType = as.character(DischargeType))
+ama_dat_evaluable
+```
+Split the data
+```{r}
+ama_split = initial_split(ama_dat, prop = .25, strata = DischargeType)
+ama_training = training(ama_split)
+ama_testing = testing(ama_split)
+ama_cv_folds =  vfold_cv(data = ama_training, v = 10)
+ama_cv_folds
+```
+Set the engine
+Figure out what each of these parameters mean and if there are more
+
+```{r}
+xgmodel<-parsnip::boost_tree(
+  mode = "classification",
+  trees = 1000, #nrounds
+  learn_rate = tune(), #eta
+  sample_size = tune(), #subsample
+  mtry = tune(), #colsample_bytree
+  min_n = tune(), #min_child_weight
+  tree_depth = tune() #max_depth
+) %>%
+  set_engine("xgboost", objective = "binary:logistic",
+             lambda=0, alpha=1, num_class=3,verbose=1)
+```
+
+Need this to help tune the model
+What do mtry and finalize mean?
+```{r}
+xgboostParams <- dials::parameters(
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  finalize(mtry(),select(ama_training,-DischargeType)),
+  sample_size = sample_prop(c(0.4, 0.9))
+)
+
+set.seed(2020)
+### This seems like a randomcv search
+xgGrid <- dials::grid_max_entropy(xgboostParams, size = 100)
+xgGrid
+
+xgWorkflow <- 
+  workflows::workflow() %>%
+  add_model(xgmodel) %>% 
+  add_formula(DischargeType ~ .)
+
+xgTuned <- tune_grid(
+  object = xgWorkflow,
+  resamples = ama_cv_folds,
+  grid      = xgGrid,
+  metrics   = metric_set(bal_accuracy),
+  control   = control_grid(verbose = TRUE))
+
+```
+
