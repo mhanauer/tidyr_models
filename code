@@ -11,141 +11,160 @@ Example websites:
 https://www.r-bloggers.com/2020/05/tidymodels-and-xgbooost-a-few-learnings/
 https://www.r-bloggers.com/2020/05/using-xgboost-with-tidymodels/
 ```{r}
-setwd("~/Google Drive/Future_skills/AMA/Data")
-ama_dat = read.csv("AMAData.csv", header = TRUE)
 library(tidymodels)
 library(dplyr)
 library(lubridate)
 library(naniar)
 library(tableone)
-library(tidypredict)
+library(DALEX)
 ```
-AMA XGBoost 
-##################
-Preprocess the data 
-##################
-Client_ASSESS_Date 
-AgeAtAdmission 
-DischargeType 
-A298_Q7 = Gender
-A298_Q6 = Race
-```{r}
-ama_dat_evaluable = ama_dat %>%
-  select(DischargeType, A298_Q7, A298_Q6, AgeAtAdmission, Client_ASSESS_Date)
-ama_dat_evaluable = ama_dat_evaluable %>%
-  mutate(DischargeType = case_when(
-    DischargeType == "AMA Against Medical Advice" ~1, 
-    TRUE ~ 0)) %>%
-  mutate(female = case_when(
-    A298_Q7 == "Female" ~ 1, 
-    TRUE ~ 0)) %>%
-  mutate(non_white = case_when(
-    A298_Q6 == "White or Caucasian" ~ 0,
-    TRUE ~ 1)) %>%
-  mutate(Client_ASSESS_Date = mdy(Client_ASSESS_Date)) %>%
-  mutate(quarter = quarter(Client_ASSESS_Date)) %>%
-  select(-c(Client_ASSESS_Date, A298_Q7, A298_Q6)) %>%
-  mutate(DischargeType = as.factor(DischargeType)) %>%
-  drop_na() 
-
-```
-Check descirptives
-```{r}
-tab1 = CreateTableOne(data = ama_dat_evaluable)
-print(tab1, showAllLevels = TRUE)
-```
-
-
+XGBoost with titanic data set 
 Split the data
 ```{r}
-ama_split = initial_split(ama_dat_evaluable, prop = .30, strata = DischargeType)
-ama_training = training(ama_split)
-ama_testing = testing(ama_split)
-ama_cv_folds =  vfold_cv(data = ama_training, v = 5)
-ama_cv_folds
+data("titanic")
+titanic_encode = titanic %>%
+  mutate(survived = case_when(
+    survived == "yes" ~ 1, 
+    TRUE ~ 0)) %>%
+  mutate(survived = as.factor(survived))
+titanic_split = initial_split(titanic_encode, prop = .25, strata = survived)
+titanic_training = training(titanic_split)
+titanic_testing = testing(titanic_split)
+### v is the number of folds and we are not repating in this case
+titanic_cv_folds =  vfold_cv(data = titanic_training, v = 5)
 ```
-Set the engine
-Figure out what each of these parameters mean and if there are more
+First use a boost_tree with classifcation to set up for xgboost
+Then select the hyperparameters (see below)
+See: https://parsnip.tidymodels.org/reference/boost_tree.html
 
+Then set the engine, which is the xgboost model and the objective function, which is binary logisitc for a classification problem
 ```{r}
 xgmodel<-parsnip::boost_tree(
   mode = "classification",
-  trees = 1000, #nrounds
+  trees = 100, #nrounds
   learn_rate = tune(), #eta
   sample_size = tune(), #subsample
   mtry = tune(), #colsample_bytree
   min_n = tune(), #min_child_weight
   tree_depth = tune() #max_depth
 ) %>%
-  set_engine("xgboost", objective = "binary:logistic",
-             lambda=0, alpha=1, num_class=3,verbose=1)
+  set_engine("xgboost", objective = "binary:logistic")
 ```
 
-Need this to help tune the model
-What do mtry and finalize mean?
+
+For mtry we need to select all possible columns expect for the outcome and need to set that in the hyperparameters selection
+For sample size also need to set that
+Here for max entropy: https://www.brodrigues.co/blog/2020-03-08-tidymodels/
 ```{r}
 xgboostParams <- dials::parameters(
   min_n(),
   tree_depth(),
   learn_rate(),
-  finalize(mtry(),select(ama_training,-DischargeType)),
+  finalize(mtry(),select(titanic_training,-survived)),
   sample_size = sample_prop(c(0.4, 0.9))
 )
 
 set.seed(2020)
-### This seems like a randomcv search
-xgGrid <- dials::grid_max_entropy(xgboostParams, size = 100)
+### Max entropy is like a random search of valid values that tries to maximize the space covered 
+xgGrid <- dials::grid_max_entropy(xgboostParams, size = 50)
 xgGrid
 
 xgWorkflow <- 
   workflows::workflow() %>%
   add_model(xgmodel) %>% 
-  add_formula(DischargeType ~ .)
+  add_formula(survived ~ .)
 
 xgTuned <- tune_grid(
   object = xgWorkflow,
-  resamples = ama_cv_folds,
+  resamples = titanic_cv_folds,
   grid      = xgGrid,
   metrics   = metric_set(bal_accuracy),
   control   = control_grid(verbose = TRUE))
-xgTuned
 ```
-Find the best model and select it
-Now how do you save the model???
+Find the best model and use as final model
+Then fit the testing data set
+Then get the predicted probabilities 
+Then get f1 values
+Then create predicted values 
+Then get classification outcomes: sens, spec, and balanced accuracy
+
 ```{r}
 xgBestParams = xgTuned %>% 
   tune::select_best(metric = "bal_accuracy")
 xgBestParams
 
+
 xgboost_model_final <- xgmodel %>% 
   finalize_model(xgBestParams)
 
 xgTrainFit<-xgboost_model_final %>% 
-  fit(DischargeType ~., data=ama_testing)
+  fit(survived ~., data=titanic_testing)
 
-xgTrainPreds<- xgTrainFit %>% predict(new_data=ama_testing)
-xgTrainPredProbs <- xgTrainFit %>% predict_classprob.model_fit(new_data=ama_testing)
+xgTrainPreds<- xgTrainFit %>% predict(new_data=titanic_testing)
+xgTrainPredProbs <- xgTrainFit %>% predict_classprob.model_fit(new_data=titanic_testing)
 xgTrainPredProbs
 
-parsed_model = parse_model(xgTrainFit)
-install.packages("yaml")
-library(yaml)
-write_yaml(parsed_model, "my_model.yml")
-
-xgTrainFit_read = read_yaml("my_model.yml")
-xgTrainFit_par <- as_parsed_model(xgTrainFit_read)
-xgTrainPreds <- xgTrainFit_par %>% predict(new_data=ama_testing)
-xgTrainPreds =  tidypredict_fit(xgTrainFit_par)
-
+```
+Save the model
+```{r}
 saveRDS(xgTrainFit, "./xgTrainFit.rds")
-
 # later...
 
 # load the model
 super_model <- readRDS("./xgTrainFit.rds")
 print(super_model)
 # make a predictions on "new data" using the final model
-test <- super_model %>% predict(new_data=ama_testing)
-test
+```
+
+Evaluate the model
+```{r}
+pred_super_model <- super_model %>% predict(new_data=titanic_testing)
+pred_super_model
+
+dat_results_titanic = data.frame(truth = titanic_testing$survived, estimate = pred_super_model)
+
+class_metrics <- metric_set(accuracy, kap, bal_accuracy, sensitivity, specificity)
+
+results_titanic =  dat_results_titanic %>%
+  class_metrics(truth = truth, estimate = .pred_class)
+results_titanic
+```
+Now get ready for xai
+```{r}
+
+titanic_gbm_exp <- explain(model = pred_super_model, 
+                       data = titanic_testing[, -9],
+                       y = titanic_testing$survived == 1, 
+                       label = "XGBoost xAI")
+titanic_gbm_exp
+henry = as.matrix(titanic_testing[1,-9])
+henry
+shapley_titanic <- predict_parts(explainer = titanic_gbm_exp,
+                 new_observation = henry,
+                            type = "break_down")
+```
+Try an example
+```{r}
+fifa
+fifa$LogValue <- log10(fifa$value_eur)
+fifa_small <- fifa[,-c(1, 2, 3, 4, 6, 7)]
+
+fifa_gbm_deep <- gbm(LogValue~., data = fifa_small, n.trees = 250, interaction.depth = 4, distribution = "gaussian")
+
+fifa_gbm_exp_deep <- DALEX::explain(fifa_gbm_deep, 
+        data = fifa_small, y = 10^fifa_small$LogValue, 
+        predict_function = function(m,x) 10^predict(m, x, n.trees = 250),
+        label = "GBM deep")
+fifa_gbm_exp_deep
+
+fifa_shap_gbm <- predict_parts(fifa_gbm_exp_deep, 
+                     new_observation = fifa["R. Lewandowski",], 
+                     type = "break_down")
+
+plot(fifa_shap_gbm, show_boxplots = FALSE) +
+  scale_y_continuous("Estimated value in Euro", 
+                   labels = dollar_format(suffix = "€", prefix = "")) + 
+  ggtitle("Shapley values for Robert Lewandowski","") 
 
 ```
+
