@@ -20,6 +20,8 @@ library(tableone)
 library(DALEX)
 library(doParallel)
 library(stringr)
+library(DALEXtra)
+library(mlr)
 all_cores <- parallel::detectCores(logical = FALSE)
 registerDoParallel(cores = all_cores)
 ```
@@ -63,8 +65,12 @@ losers <- vb_parsed %>%
   mutate(win = "lose")
 
 vb_df <- bind_rows(winners, losers) %>%
-  mutate_if(is.character, factor)
-vb_df = sample_n(vb_df, 5000)
+  mutate_if(is.character, factor) %>%
+  mutate(win = case_when(
+    win == "win" ~ 1, 
+    TRUE ~ 0)) %>%
+  mutate(win = as.factor(win))
+vb_df = sample_n(vb_df, 3000)
 ```
 Split the data
 ```{r}
@@ -106,7 +112,7 @@ xgb_grid <- grid_max_entropy(
   sample_size = sample_prop(),
   finalize(mtry(), select(vb_train, -win)),
   learn_rate(),
-  size = 30
+  size = 10
 )
 
 ```
@@ -115,15 +121,13 @@ It has the formula and then you add the specs
 ```{r}
 xgb_wf <- workflow() %>%
   add_formula(win ~ .) %>%
-  add_model(xgb_spec)
-xgb_wf
+  add_model(xgb_spec) 
 ```
 Now put together cross validation
 Default is 10 cross folds
 ```{r}
 set.seed(123)
 vb_folds <- vfold_cv(vb_train, strata = win, v = 5)
-vb_folds
 ```
 Now you tune the model
 ```{r}
@@ -133,8 +137,7 @@ xgb_res <- tune_grid(
   xgb_wf,
   resamples = vb_folds,
   grid = xgb_grid,
-  control = control_grid(save_pred = TRUE)
-)
+  control = control_grid(save_pred = TRUE))
 ```
 Select the best model
 Get evaluation metrics
@@ -152,16 +155,48 @@ final_res <- last_fit(final_xgb, vb_split)
 collect_metrics(final_res)
 preds =  final_res %>%
   collect_predictions()
-preds
+preds$.pred_class
 
 collect_metrics(final_res)
 ```
 Save the model
 ```{r}
-saveRDS(xgTrainFit, "./xgTrainFit.rds")
+saveRDS(final_res, "./final_res.rds")
 # later...
 
 # load the model
-super_model <- readRDS("./xgTrainFit.rds")
+super_model <- readRDS("./final_res.rds")
+```
+
+Need to make the tidymodel work with DALEX
+```{r}
+
+fit_dalex <- fit(final_xgb, vb_test)
+
+explainer_2 <- DALEX::explain(fit_dalex, data = select(vb_test, -win), as.numeric(vb_test$win))
+explainer_2
+vip_gbm <- variable_importance(explainer_2)
+vip_gbm
+```
+Now try shapley values
+```{r}
+henry = vb_test[1,]
+
+shap_henry <- predict_parts(explainer = explainer_2, 
+                      new_observation = henry, 
+                                 type = "shap",
+                                    B = 25)
+plot(shap_henry)
+```
+Now try the what if analysis
+https://ema.drwhy.ai/ceterisParibus.html
+```{r}
+henry$gender = as.character(henry$gender)
+what_if_vb <- predict_profile(explainer = explainer_2, new_observation = henry)
+what_if_vb
+plot(what_if_vb, variables = c("kills"))
+
+### Women's VB team
+plot(what_if_vb, variables = "gender", variable_type = "categorical", categorical_type = "bars")
 ```
 
