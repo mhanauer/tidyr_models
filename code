@@ -17,6 +17,9 @@ library(lubridate)
 library(naniar)
 library(tableone)
 library(DALEX)
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
 ```
 XGBoost with titanic data set 
 Split the data
@@ -26,7 +29,8 @@ titanic_encode = titanic %>%
   mutate(survived = case_when(
     survived == "yes" ~ 1, 
     TRUE ~ 0)) %>%
-  mutate(survived = as.factor(survived))
+  mutate(survived = as.factor(survived)) %>%
+  drop_na()
 titanic_split = initial_split(titanic_encode, prop = .25, strata = survived)
 titanic_training = training(titanic_split)
 titanic_testing = testing(titanic_split)
@@ -78,7 +82,7 @@ xgTuned <- tune_grid(
   object = xgWorkflow,
   resamples = titanic_cv_folds,
   grid      = xgGrid,
-  metrics   = metric_set(bal_accuracy),
+  metrics   = metric_set(accuracy),
   control   = control_grid(verbose = TRUE))
 ```
 Find the best model and use as final model
@@ -90,7 +94,7 @@ Then get classification outcomes: sens, spec, and balanced accuracy
 
 ```{r}
 xgBestParams = xgTuned %>% 
-  tune::select_best(metric = "bal_accuracy")
+  tune::select_best(metric = "accuracy")
 xgBestParams
 
 
@@ -101,7 +105,7 @@ xgTrainFit<-xgboost_model_final %>%
   fit(survived ~., data=titanic_testing)
 
 xgTrainPreds<- xgTrainFit %>% predict(new_data=titanic_testing)
-xgTrainPredProbs <- xgTrainFit %>% predict_classprob.model_fit(new_data=titanic_testing)
+xgTrainPredProbs <- xgTrainFit %>% predict(new_data=titanic_testing, type="prob")
 xgTrainPredProbs
 
 ```
@@ -165,6 +169,17 @@ plot(fifa_shap_gbm, show_boxplots = FALSE) +
   scale_y_continuous("Estimated value in Euro", 
                    labels = dollar_format(suffix = "€", prefix = "")) + 
   ggtitle("Shapley values for Robert Lewandowski","") 
+
+```
+Try classifcation with random forrest
+```{r}
+titanic_ranger <- rand_forest(trees = 100, mode = "classification") %>%
+  set_engine("ranger") %>%
+  fit(survived ~ ., data = titanic_training)
+
+titanic_ranger_probs <- titanic_ranger %>% 
+  predict(new_data=  titanic_testing, type="prob")
+titanic_ranger_probs
 
 ```
 
