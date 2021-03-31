@@ -10,6 +10,7 @@ Load and library data
 Example websites:
 https://www.r-bloggers.com/2020/05/tidymodels-and-xgbooost-a-few-learnings/
 https://www.r-bloggers.com/2020/05/using-xgboost-with-tidymodels/
+https://juliasilge.com/blog/xgboost-tune-volleyball/
 ```{r}
 library(tidymodels)
 library(dplyr)
@@ -18,168 +19,173 @@ library(naniar)
 library(tableone)
 library(DALEX)
 library(doParallel)
+library(stringr)
+library(DALEXtra)
+library(mlr)
 all_cores <- parallel::detectCores(logical = FALSE)
 registerDoParallel(cores = all_cores)
 ```
-XGBoost with titanic data set 
+Data prep
+```{r}
+#vb_matches <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-19/vb_matches.csv', guess_max = 76000)
+vb_matches
+
+vb_parsed <- vb_matches %>%
+  transmute(
+    circuit,
+    gender,
+    year,
+    w_attacks = w_p1_tot_attacks + w_p2_tot_attacks,
+    w_kills = w_p1_tot_kills + w_p2_tot_kills,
+    w_errors = w_p1_tot_errors + w_p2_tot_errors,
+    w_aces = w_p1_tot_aces + w_p2_tot_aces,
+    w_serve_errors = w_p1_tot_serve_errors + w_p2_tot_serve_errors,
+    w_blocks = w_p1_tot_blocks + w_p2_tot_blocks,
+    w_digs = w_p1_tot_digs + w_p2_tot_digs,
+    l_attacks = l_p1_tot_attacks + l_p2_tot_attacks,
+    l_kills = l_p1_tot_kills + l_p2_tot_kills,
+    l_errors = l_p1_tot_errors + l_p2_tot_errors,
+    l_aces = l_p1_tot_aces + l_p2_tot_aces,
+    l_serve_errors = l_p1_tot_serve_errors + l_p2_tot_serve_errors,
+    l_blocks = l_p1_tot_blocks + l_p2_tot_blocks,
+    l_digs = l_p1_tot_digs + l_p2_tot_digs
+  ) %>%
+  na.omit()
+
+winners <- vb_parsed %>%
+  select(circuit, gender, year,
+         w_attacks:w_digs) %>%
+  rename_with(~ str_remove_all(., "w_"), w_attacks:w_digs) %>%
+  mutate(win = "win")
+
+losers <- vb_parsed %>%
+  select(circuit, gender, year,
+         l_attacks:l_digs) %>%
+  rename_with(~ str_remove_all(., "l_"), l_attacks:l_digs) %>%
+  mutate(win = "lose")
+
+vb_df <- bind_rows(winners, losers) %>%
+  mutate_if(is.character, factor) %>%
+  mutate(win = case_when(
+    win == "win" ~ 1, 
+    TRUE ~ 0)) %>%
+  mutate(win = as.factor(win))
+vb_df = sample_n(vb_df, 3000)
+```
 Split the data
 ```{r}
-data("titanic")
-titanic_encode = titanic %>%
-  mutate(survived = case_when(
-    survived == "yes" ~ 1, 
-    TRUE ~ 0)) %>%
-  mutate(survived = as.factor(survived)) %>%
-  drop_na()
-titanic_split = initial_split(titanic_encode, prop = .25, strata = survived)
-titanic_training = training(titanic_split)
-titanic_testing = testing(titanic_split)
-### v is the number of folds and we are not repating in this case
-titanic_cv_folds =  vfold_cv(data = titanic_training, v = 5)
+set.seed(123)
+vb_split <- initial_split(vb_df, strata = win)
+vb_train <- training(vb_split)
+vb_test <- testing(vb_split)
+
 ```
+
+
+Now set up the tunning search specs 
 First use a boost_tree with classifcation to set up for xgboost
 Then select the hyperparameters (see below)
 See: https://parsnip.tidymodels.org/reference/boost_tree.html
 
 Then set the engine, which is the xgboost model and the objective function, which is binary logisitc for a classification problem
-```{r}
-xgmodel<-parsnip::boost_tree(
-  mode = "classification",
-  trees = 100, #nrounds
-  learn_rate = tune(), #eta
-  sample_size = tune(), #subsample
-  mtry = tune(), #colsample_bytree
-  min_n = tune(), #min_child_weight
-  tree_depth = tune() #max_depth
-) %>%
-  set_engine("xgboost", objective = "binary:logistic")
-```
-
 
 For mtry we need to select all possible columns expect for the outcome and need to set that in the hyperparameters selection
 For sample size also need to set that
 Here for max entropy: https://www.brodrigues.co/blog/2020-03-08-tidymodels/
 ```{r}
-xgboostParams <- dials::parameters(
-  min_n(),
+xgb_spec <- boost_tree(
+  trees = 1000, 
+  tree_depth = tune(), min_n = tune(), 
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune(),                         ## step size
+) %>% 
+  set_engine("xgboost", objective = "binary:logistic") %>% 
+  set_mode("classification")
+```
+Now set up the grid search
+```{r}
+xgb_grid <- grid_max_entropy(
   tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), select(vb_train, -win)),
   learn_rate(),
-  finalize(mtry(),select(titanic_training,-survived)),
-  sample_size = sample_prop(c(0.4, 0.9))
+  size = 10
 )
 
-set.seed(2020)
-### Max entropy is like a random search of valid values that tries to maximize the space covered 
-xgGrid <- dials::grid_max_entropy(xgboostParams, size = 50)
-xgGrid
-
-xgWorkflow <- 
-  workflows::workflow() %>%
-  add_model(xgmodel) %>% 
-  add_formula(survived ~ .)
-
-xgTuned <- tune_grid(
-  object = xgWorkflow,
-  resamples = titanic_cv_folds,
-  grid      = xgGrid,
-  metrics   = metric_set(accuracy),
-  control   = control_grid(verbose = TRUE))
 ```
-Find the best model and use as final model
-Then fit the testing data set
-Then get the predicted probabilities 
-Then get f1 values
-Then create predicted values 
-Then get classification outcomes: sens, spec, and balanced accuracy
-
+This is the workflow
+It has the formula and then you add the specs
 ```{r}
-xgBestParams = xgTuned %>% 
-  tune::select_best(metric = "accuracy")
-xgBestParams
+xgb_wf <- workflow() %>%
+  add_formula(win ~ .) %>%
+  add_model(xgb_spec) 
+```
+Now put together cross validation
+Default is 10 cross folds
+```{r}
+set.seed(123)
+vb_folds <- vfold_cv(vb_train, strata = win, v = 5)
+```
+Now you tune the model
+```{r}
+doParallel::registerDoParallel()
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = vb_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE))
+```
+Select the best model
+Get evaluation metrics
+Get predictions
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
 
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
 
-xgboost_model_final <- xgmodel %>% 
-  finalize_model(xgBestParams)
+final_res <- last_fit(final_xgb, vb_split)
 
-xgTrainFit<-xgboost_model_final %>% 
-  fit(survived ~., data=titanic_testing)
+collect_metrics(final_res)
+preds =  final_res %>%
+  collect_predictions()
+preds$.pred_class
 
-xgTrainPreds<- xgTrainFit %>% predict(new_data=titanic_testing)
-xgTrainPredProbs <- xgTrainFit %>% predict(new_data=titanic_testing, type="prob")
-xgTrainPredProbs
-
+collect_metrics(final_res)
 ```
 Save the model
 ```{r}
-saveRDS(xgTrainFit, "./xgTrainFit.rds")
+saveRDS(final_res, "./final_res.rds")
 # later...
 
 # load the model
-super_model <- readRDS("./xgTrainFit.rds")
-print(super_model)
-# make a predictions on "new data" using the final model
+super_model <- readRDS("./final_res.rds")
 ```
 
-Evaluate the model
+Need to make the tidymodel work with DALEX
 ```{r}
-pred_super_model <- super_model %>% predict(new_data=titanic_testing)
-pred_super_model
 
-dat_results_titanic = data.frame(truth = titanic_testing$survived, estimate = pred_super_model)
+fit_dalex <- fit(final_xgb, vb_test)
 
-class_metrics <- metric_set(accuracy, kap, bal_accuracy, sensitivity, specificity)
-
-results_titanic =  dat_results_titanic %>%
-  class_metrics(truth = truth, estimate = .pred_class)
-results_titanic
+explainer_2 <- DALEX::explain(fit_dalex, data = select(vb_test, -win), as.numeric(vb_test$win))
+explainer_2
+vip_gbm <- variable_importance(explainer_2)
+vip_gbm
 ```
-Now get ready for xai
+Now try shapley values
 ```{r}
+henry = vb_test[1,]
 
-titanic_gbm_exp <- explain(model = pred_super_model, 
-                       data = titanic_testing[, -9],
-                       y = titanic_testing$survived == 1, 
-                       label = "XGBoost xAI")
-titanic_gbm_exp
-henry = as.matrix(titanic_testing[1,-9])
-henry
-shapley_titanic <- predict_parts(explainer = titanic_gbm_exp,
-                 new_observation = henry,
-                            type = "break_down")
-```
-Try an example
-```{r}
-fifa
-fifa$LogValue <- log10(fifa$value_eur)
-fifa_small <- fifa[,-c(1, 2, 3, 4, 6, 7)]
-
-fifa_gbm_deep <- gbm(LogValue~., data = fifa_small, n.trees = 250, interaction.depth = 4, distribution = "gaussian")
-
-fifa_gbm_exp_deep <- DALEX::explain(fifa_gbm_deep, 
-        data = fifa_small, y = 10^fifa_small$LogValue, 
-        predict_function = function(m,x) 10^predict(m, x, n.trees = 250),
-        label = "GBM deep")
-fifa_gbm_exp_deep
-
-fifa_shap_gbm <- predict_parts(fifa_gbm_exp_deep, 
-                     new_observation = fifa["R. Lewandowski",], 
-                     type = "break_down")
-
-plot(fifa_shap_gbm, show_boxplots = FALSE) +
-  scale_y_continuous("Estimated value in Euro", 
-                   labels = dollar_format(suffix = "€", prefix = "")) + 
-  ggtitle("Shapley values for Robert Lewandowski","") 
-
-```
-Try classifcation with random forrest
-```{r}
-titanic_ranger <- rand_forest(trees = 100, mode = "classification") %>%
-  set_engine("ranger") %>%
-  fit(survived ~ ., data = titanic_training)
-
-titanic_ranger_probs <- titanic_ranger %>% 
-  predict(new_data=  titanic_testing, type="prob")
-titanic_ranger_probs
-
+shap_henry <- predict_parts(explainer = explainer_2, 
+                      new_observation = henry, 
+                                 type = "shap",
+                                    B = 25)
+plot(shap_henry)
 ```
 
