@@ -7,10 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 Load and library data 
-Example websites:
-https://www.r-bloggers.com/2020/05/tidymodels-and-xgbooost-a-few-learnings/
-https://www.r-bloggers.com/2020/05/using-xgboost-with-tidymodels/
-https://juliasilge.com/blog/xgboost-tune-volleyball/
+https://smltar.com/tokenization.html
 ```{r}
 library(tidymodels)
 library(dplyr)
@@ -22,181 +19,115 @@ library(doParallel)
 library(stringr)
 library(DALEXtra)
 library(mlr)
+library(tokenizers)
+library(tidyverse)
+library(tidytext)
+library(hcandersenr)
+library(stopwords)
+library(SnowballC) 
+library(quanteda)
+library(textrecipes)
 all_cores <- parallel::detectCores(logical = FALSE)
 registerDoParallel(cores = all_cores)
 ```
-Data prep
+Load in the data 
 ```{r}
-#vb_matches <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-19/vb_matches.csv', guess_max = 76000)
-vb_matches
-
-vb_parsed <- vb_matches %>%
-  transmute(
-    circuit,
-    gender,
-    year,
-    w_attacks = w_p1_tot_attacks + w_p2_tot_attacks,
-    w_kills = w_p1_tot_kills + w_p2_tot_kills,
-    w_errors = w_p1_tot_errors + w_p2_tot_errors,
-    w_aces = w_p1_tot_aces + w_p2_tot_aces,
-    w_serve_errors = w_p1_tot_serve_errors + w_p2_tot_serve_errors,
-    w_blocks = w_p1_tot_blocks + w_p2_tot_blocks,
-    w_digs = w_p1_tot_digs + w_p2_tot_digs,
-    l_attacks = l_p1_tot_attacks + l_p2_tot_attacks,
-    l_kills = l_p1_tot_kills + l_p2_tot_kills,
-    l_errors = l_p1_tot_errors + l_p2_tot_errors,
-    l_aces = l_p1_tot_aces + l_p2_tot_aces,
-    l_serve_errors = l_p1_tot_serve_errors + l_p2_tot_serve_errors,
-    l_blocks = l_p1_tot_blocks + l_p2_tot_blocks,
-    l_digs = l_p1_tot_digs + l_p2_tot_digs
-  ) %>%
-  na.omit()
-
-winners <- vb_parsed %>%
-  select(circuit, gender, year,
-         w_attacks:w_digs) %>%
-  rename_with(~ str_remove_all(., "w_"), w_attacks:w_digs) %>%
-  mutate(win = "win")
-
-losers <- vb_parsed %>%
-  select(circuit, gender, year,
-         l_attacks:l_digs) %>%
-  rename_with(~ str_remove_all(., "l_"), l_attacks:l_digs) %>%
-  mutate(win = "lose")
-
-vb_df <- bind_rows(winners, losers) %>%
-  mutate_if(is.character, factor) %>%
-  mutate(win = case_when(
-    win == "win" ~ 1, 
-    TRUE ~ 0)) %>%
-  mutate(win = as.factor(win))
-vb_df = sample_n(vb_df, 3000)
+setwd("~/Google Drive/Cook/data")
+text_dat = read.csv("20210309_atc_mlk_collins_fauci_full.csv", header = TRUE)
+text_dat = text_dat %>%
+  select(Text, Speaker)
+text_dat$id = 1:dim(text_dat)[1]
 ```
-Split the data
-```{r}
-set.seed(123)
-vb_split <- initial_split(vb_df, strata = win)
-vb_train <- training(vb_split)
-vb_test <- testing(vb_split)
-
-```
-
-
-Now set up the tunning search specs 
-First use a boost_tree with classifcation to set up for xgboost
-Then select the hyperparameters (see below)
-See: https://parsnip.tidymodels.org/reference/boost_tree.html
-
-Then set the engine, which is the xgboost model and the objective function, which is binary logisitc for a classification problem
-
-For mtry we need to select all possible columns expect for the outcome and need to set that in the hyperparameters selection
-For sample size also need to set that
-Here for max entropy: https://www.brodrigues.co/blog/2020-03-08-tidymodels/
-```{r}
-xgb_spec <- boost_tree(
-  trees = 1000, 
-  tree_depth = tune(), min_n = tune(), 
-  loss_reduction = tune(),                     ## first three: model complexity
-  sample_size = tune(), mtry = tune(),         ## randomness
-  learn_rate = tune(),                         ## step size
-) %>% 
-  set_engine("xgboost", objective = "binary:logistic") %>% 
-  set_mode("classification")
-```
-Now set up the grid search
-```{r}
-xgb_grid <- grid_max_entropy(
-  tree_depth(),
-  min_n(),
-  loss_reduction(),
-  sample_size = sample_prop(),
-  finalize(mtry(), select(vb_train, -win)),
-  learn_rate(),
-  size = 10
-)
-
-```
-This is the workflow
-It has the formula and then you add the specs
-```{r}
-xgb_wf <- workflow() %>%
-  add_formula(win ~ .) %>%
-  add_model(xgb_spec) 
-```
-Now put together cross validation
-Default is 10 cross folds
-```{r}
-set.seed(123)
-vb_folds <- vfold_cv(vb_train, strata = win, v = 5)
-```
-Now you tune the model
-```{r}
-doParallel::registerDoParallel()
-set.seed(234)
-xgb_res <- tune_grid(
-  xgb_wf,
-  resamples = vb_folds,
-  grid = xgb_grid,
-  control = control_grid(save_pred = TRUE))
-```
-Select the best model
-Get evaluation metrics
-Get predictions
-```{r}
-best_auc <- select_best(xgb_res, "roc_auc")
-
-final_xgb <- finalize_workflow(
-  xgb_wf,
-  best_auc
-)
-
-final_res <- last_fit(final_xgb, vb_split)
-
-collect_metrics(final_res)
-preds =  final_res %>%
-  collect_predictions()
-preds$.pred_class
-
-collect_metrics(final_res)
-```
-Save the model
-```{r}
-saveRDS(final_res, "./final_res.rds")
-# later...
-
-# load the model
-super_model <- readRDS("./final_res.rds")
-```
-
-Need to make the tidymodel work with DALEX
+Try tokenizing 
 ```{r}
 
-fit_dalex <- fit(final_xgb, vb_test)
+text_token = tokenize_words(text_dat$Text)
+text_dat_eval = text_dat %>%
+  select(Text) %>%
+  tibble() %>%
+  rename(text = Text)
+text_dat_eval  
+text_dat_eval
+unnest_tokens(text_dat_eval,word, text, token = "words", strip_punct = )
 
-explainer_2 <- DALEX::explain(fit_dalex, data = select(vb_test, -win), as.numeric(vb_test$win))
-explainer_2
-vip_gbm <- variable_importance(explainer_2)
-vip_gbm
+
+
 ```
-Now try shapley values
+Try counting the number of words
 ```{r}
-henry = vb_test[1,]
-
-shap_henry <- predict_parts(explainer = explainer_2, 
-                      new_observation = henry, 
-                                 type = "shap",
-                                    B = 25)
-plot(shap_henry)
-```
-Now try the what if analysis
-https://ema.drwhy.ai/ceterisParibus.html
+text_dat %>%
+  unnest_tokens(word, Text) %>%
+  count(Speaker, word) %>%
+  group_by(Speaker) %>%
+   arrange(desc(n))
+``` 
+Now remove stopwords and setm
 ```{r}
-henry$gender = as.character(henry$gender)
-what_if_vb <- predict_profile(explainer = explainer_2, new_observation = henry)
-what_if_vb
-plot(what_if_vb, variables = c("kills"))
-
-### Women's VB team
-plot(what_if_vb, variables = "gender", variable_type = "categorical", categorical_type = "bars")
+text_dat_clean = text_dat %>%
+  #Make each word its own row
+  unnest_tokens(word, Text) %>%
+  ## Remove stop words
+  anti_join(get_stopwords(source = "snowball")) %>%
+  ## Stem words
+  mutate(word = wordStem(word))
+  
+text_dat_clean
 ```
+Count words without stop words
+Term frequency: How often that term is used in a document which in this case is the change in speaker
+```{r}
+text_dat_clean_count = text_dat_clean %>%
+    group_by(id) %>%
+  count(word, sort = TRUE) %>%
+  cast_dfm(id, word, n)
+text_dat_clean_count
+
+```
+Now try deep learning with example
+```{r}
+set.seed(1234)
+ks_split= ks_dat %>%
+  filter(nchar(name) >= 15) %>%
+  initial_split()
+ks_train = training(ks_split)
+ks_test = testing(ks_split)
+
+```
+We need to select the sequence so the length of documents we want to include.  For sequences that are shorter than our selected length they include padding (i.e., zeros) and longer documents are cut off.
+
+Limit the sequence length (number of words per sequence) to 15 
+Then limit the total number of words to 20,000 
+```{r}
+library(textrecipes)
+ks_train %>%
+  mutate(n_words = tokenizers::count_words(name)) %>%
+  ggplot(aes(n_words)) +
+  geom_bar() +
+  labs(x = "Number of words per campaign blurb",
+       y = "Number of campaign blurbs")
+
+
+
+
+```
+Now get the recipe ready
+The number of rows is the number of rows in the original data set
+The number of columns is the number the max_length per sequence (i.e., the row).
+The numbers are the indexes for the words in alphabetical order.  If the sequence (i.e., original row of data) only contained three words then only the last 28 columns (i.e., sequences) will contain numbers.
+```{r}
+max_words <- 20000
+max_length <- 30
+
+kick_rec <- recipe(~ name, data = ks_train) %>%
+  step_tokenize(name)  %>%
+  step_tokenfilter(name, max_tokens = max_words) %>%
+  step_sequence_onehot(name, sequence_length = max_length)
+kick_prep <-  prep(kick_rec)
+kick_train <- bake(kick_prep, new_data = NULL, composition = "matrix")
+kick_train
+```
+
+
+Now try scrapping twitter data and conducting sentiment analysis
+
 
